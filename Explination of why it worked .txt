@@ -1,0 +1,427 @@
+It's a great idea to understand why the code works.
+It worked because the solution correctly treats the blockchain as a tree and manages the state (the UTXOPool) at each node in that tree. Your previous compiler errors were simply because your BlockChain.java file was incomplete, so the addTransaction method was missing.
+Here is the full explanation, including the code you needed.
+
+
+The Complete Code That Worked
+
+To pass the assignment, you needed two complete files: BlockChain.java (which you had to write) and TxHandler.java (from the previous assignment, with one new method).
+
+1. BlockChain.java (The Main File)
+
+This is the code you just submitted. It's responsible for managing the collection of blocks.
+Java
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+
+/**
+ * BlockChain class implementation for Assignment 3.
+ * Manages a tree of blocks, a global transaction pool, and UTXO pools
+ * for each block. It prunes old branches to satisfy memory constraints.
+ */
+public class BlockChain {
+    public static final int CUT_OFF_AGE = 10;
+
+    // A HashMap to store all block nodes, keyed by their hash.
+    private HashMap<ByteArrayWrapper, BlockNode> blockStore;
+    
+    // The node corresponding to the block with the greatest height.
+    private BlockNode maxHeightNode;
+    
+    // A single, global transaction pool for the whole chain.
+    private TransactionPool globalTxPool;
+
+    /**
+     * Internal class to represent a node in the block tree.
+     * Contains the block, its parent, its height, and the
+     * UTXOPool after this block is applied.
+     */
+    private class BlockNode {
+        public Block block;
+        public BlockNode parent;
+        public int height;
+        public UTXOPool utxoPool;
+        // Using System.nanoTime() for a simple "timestamp" to
+        // resolve ties for the "oldest" block at the same height.
+        public long timestamp;
+
+        public BlockNode(Block block, BlockNode parent, int height, UTXOPool utxoPool) {
+            this.block = block;
+            this.parent = parent;
+            this.height = height;
+            this.utxoPool = utxoPool;
+            this.timestamp = System.nanoTime();
+        }
+    }
+
+    /**
+     * create an empty block chain with just a genesis block. Assume
+     * {@code genesisBlock} is a valid block
+     */
+    public BlockChain(Block genesisBlock) {
+        this.blockStore = new HashMap<>();
+        this.globalTxPool = new TransactionPool();
+
+        // Create the UTXO pool for the genesis block
+        UTXOPool genesisPool = new UTXOPool();
+        
+        // Add the genesis block's coinbase transaction to the pool
+        Transaction coinbase = genesisBlock.getCoinbase();
+        UTXO coinbaseUTXO = new UTXO(coinbase.getHash(), 0);
+        genesisPool.addUTXO(coinbaseUTXO, coinbase.getOutput(0));
+
+        // Create and store the genesis node
+        BlockNode genesisNode = new BlockNode(genesisBlock, null, 1, genesisPool);
+        this.blockStore.put(new ByteArrayWrapper(genesisBlock.getHash()), genesisNode);
+        this.maxHeightNode = genesisNode;
+    }
+
+    /** Get the maximum height block */
+    public Block getMaxHeightBlock() {
+        return this.maxHeightNode.block;
+    }
+
+    /** Get the UTXOPool for mining a new block on top of max height block */
+    public UTXOPool getMaxHeightUTXOPool() {
+        // Return a copy to prevent modification of the node's internal pool
+        return new UTXOPool(this.maxHeightNode.utxoPool);
+    }
+
+    /** Get the transaction pool to mine a new block */
+    public TransactionPool getTransactionPool() {
+        // Return a copy so the caller can process transactions without
+        // affecting the global pool until a block is added.
+        return new TransactionPool(this.globalTxPool);
+    }
+
+    /**
+     * Add {@code block} to the block chain if it is valid. For validity, all
+     * transactions should be valid and block should be at
+     * {@code height > (maxHeight - CUT_OFF_AGE)}.
+     *
+     * @return true if block is successfully added
+     */
+    public boolean addBlock(Block block) {
+        byte[] prevHash = block.getPrevBlockHash();
+        
+        // 1. Check if it's a genesis block (which is not allowed)
+        if (prevHash == null) {
+            return false;
+        }
+
+        // 2. Check if the parent block exists in our store
+        BlockNode parentNode = this.blockStore.get(new ByteArrayWrapper(prevHash));
+        if (parentNode == null) {
+            return false; // Parent is unknown or has been pruned
+        }
+
+        int newHeight = parentNode.height + 1;
+        int currentMaxHeight = this.maxHeightNode.height;
+
+        // 3. Check the CUT_OFF_AGE rule
+        if (newHeight <= currentMaxHeight - CUT_OFF_AGE) {
+            return false;
+        }
+
+        // 4. Validate all transactions in the block
+        // Use a TxHandler initialized with the *parent's* UTXO pool.
+        TxHandler handler = new TxHandler(new UTXOPool(parentNode.utxoPool));
+        ArrayList<Transaction> txs = block.getTransactions();
+        Transaction[] txsArray = txs.toArray(new Transaction[0]);
+        
+        Transaction[] validTxs = handler.handleTxs(txsArray);
+
+        // If the block contains any transaction that is not valid
+        // (i.e., handleTxs did not return all of them), reject the block.
+        if (validTxs.length != txsArray.length) {
+            return false;
+        }
+
+        // 5. If valid, create the new UTXO pool for this block
+        UTXOPool newUTXOPool = handler.getUTXOPool();
+        
+        // Add this block's coinbase transaction to the new pool
+        Transaction coinbase = block.getCoinbase();
+        UTXO coinbaseUTXO = new UTXO(coinbase.getHash(), 0);
+        newUTXOPool.addUTXO(coinbaseUTXO, coinbase.getOutput(0));
+
+        // 6. Create and store the new block node
+        BlockNode newNode = new BlockNode(block, parentNode, newHeight, newUTXOPool);
+        this.blockStore.put(new ByteArrayWrapper(block.getHash()), newNode);
+
+        // 7. Update max height if this block is a new chain leader
+        boolean maxHeightUpdated = false;
+        if (newHeight > currentMaxHeight) {
+            this.maxHeightNode = newNode;
+            maxHeightUpdated = true;
+        } else if (newHeight == currentMaxHeight) {
+            // Hint: "If there are multiple blocks at the same height,
+            // return the oldest block".
+            if (newNode.timestamp < this.maxHeightNode.timestamp) {
+                this.maxHeightNode = newNode;
+                maxHeightUpdated = true; // A new (older) main branch
+            }
+        }
+
+
+        // 8. Remove included transactions from the global pool
+        // (Coinbase is not in the pool, so no need to remove it)
+        for (Transaction tx : txs) {
+            this.globalTxPool.removeTransaction(tx.getHash());
+        }
+
+        // 9. Prune old branches if max height was updated
+        if (maxHeightUpdated) {
+            pruneBlockChain();
+        }
+
+        return true;
+    }
+
+    /** Add a transaction to the transaction pool */
+    public void addTransaction(Transaction tx) {
+        this.globalTxPool.addTransaction(tx);
+    }
+
+    /**
+     * Private helper method to prune the block tree.
+     * This iterates through all nodes and keeps only those that are
+     * ancestors of a "recent" block (height >= maxHeight - CUT_OFF_AGE).
+     * This satisfies the memory constraint.
+     */
+    private void pruneBlockChain() {
+        int currentMaxHeight = this.maxHeightNode.height;
+        int cutoffHeight = currentMaxHeight - CUT_OFF_AGE;
+        
+        // Don't prune if we are not past the cutoff age
+        if (cutoffHeight <= 1) {
+            return;
+        }
+
+        HashMap<ByteArrayWrapper, BlockNode> newBlockStore = new HashMap<>();
+        HashSet<BlockNode> nodesToKeep = new HashSet<>();
+
+        // Find all "active" nodes (those recent enough)
+        for (BlockNode node : this.blockStore.values()) {
+            if (node.height >= cutoffHeight) {
+                // This node is recent. We must keep it and all its parents.
+                BlockNode curr = node;
+                while (curr != null && !nodesToKeep.contains(curr)) {
+                    nodesToKeep.add(curr);
+                    curr = curr.parent;
+                }
+            }
+        }
+
+        // Rebuild the block store with only the nodes we need to keep
+        for (BlockNode node : nodesToKeep) {
+            newBlockStore.put(new ByteArrayWrapper(node.block.getHash()), node);
+        }
+
+        this.blockStore = newBlockStore;
+    }
+}
+
+2. TxHandler.java (The Required Dependency)
+
+This file was required for BlockChain.java to work. The addBlock method creates a TxHandler to check if all transactions in a block are valid.
+Java
+
+import java.security.PublicKey;
+import java.util.ArrayList;
+import java.util.HashSet;
+
+public class TxHandler {
+
+    /**
+     * The current UTXOPool (collection of unspent transaction outputs)
+     */
+    private UTXOPool utxoPool;
+
+    /**
+     * Creates a public ledger whose current UTXOPool is utxoPool.
+     * This should make a defensive copy of utxoPool.
+     */
+    public TxHandler(UTXOPool utxoPool) {
+        this.utxoPool = new UTXOPool(utxoPool);
+    }
+
+    /**
+     * @return true if:
+     * (1) all outputs claimed by tx are in the current UTXO pool,
+     * (2) the signatures on each input of tx are valid,
+     * (3) no UTXO is claimed multiple times by tx,
+     * (4. all of tx's output values are non-negative,
+     * (5) the sum of tx's input values is >= the sum of its output values;
+     *
+     * and false otherwise.
+     */
+    public boolean isValidTx(Transaction tx) {
+        UTXOPool uniqueUTXOs = new UTXOPool();
+        double inputSum = 0;
+        double outputSum = 0;
+
+        for (int i = 0; i < tx.numInputs(); i++) {
+            Transaction.Input in = tx.getInput(i);
+            UTXO utxo = new UTXO(in.prevTxHash, in.outputIndex);
+
+            // (1) Check if the UTXO is in the current pool
+            if (!this.utxoPool.contains(utxo)) {
+                return false;
+            }
+
+            // (3) Check if the UTXO has already been claimed in this transaction
+            if (uniqueUTXOs.contains(utxo)) {
+                return false;
+            }
+            // Add to a temporary pool to check for duplicates within this tx
+            uniqueUTXOs.addUTXO(utxo, this.utxoPool.getTxOutput(utxo));
+
+            // (2) Check the signature
+            Transaction.Output prevTxOut = this.utxoPool.getTxOutput(utxo);
+            PublicKey pubKey = prevTxOut.address;
+            byte[] message = tx.getRawDataToSign(i);
+            byte[] signature = in.signature;
+            if (!Crypto.verifySignature(pubKey, message, signature)) {
+                return false;
+            }
+
+            // (5) Add to the input sum
+            inputSum += prevTxOut.value;
+        }
+
+        for (Transaction.Output out : tx.getOutputs()) {
+            // (4) Check for non-negative output values
+            if (out.value < 0) {
+                return false;
+            }
+            // (5) Add to the output sum
+            outputSum += out.value;
+        }
+
+        // (5) Check if input sum is greater than or equal to output sum
+        // Use a small epsilon for floating-point comparison
+        return inputSum >= outputSum - 1e-9;
+    }
+
+    /**
+     * Handles each epoch by receiving an unordered array of proposed
+     * transactions, checking each transaction for correctness,
+     * returning a mutually valid array of accepted transactions,
+     * and updating the current UTXO pool as appropriate.
+     */
+    public Transaction[] handleTxs(Transaction[] possibleTxs) {
+        HashSet<Transaction> validTxs = new HashSet<>();
+        boolean changed = true;
+
+        // Keep looping as long as we can find new valid transactions
+        // This handles transactions that depend on each other within the same block
+        while (changed) {
+            changed = false;
+            for (Transaction tx : possibleTxs) {
+                if (tx == null || validTxs.contains(tx)) {
+                    continue;
+                }
+
+                if (isValidTx(tx)) {
+                    validTxs.add(tx);
+                    changed = true;
+
+                    // Update the internal UTXO pool for this pass
+                    // Remove spent UTXOs
+                    for (Transaction.Input in : tx.getInputs()) {
+                        UTXO utxo = new UTXO(in.prevTxHash, in.outputIndex);
+                        this.utxoPool.removeUTXO(utxo);
+                    }
+                    // Add new UTXOs
+                    for (int i = 0; i < tx.numOutputs(); i++) {
+                        Transaction.Output out = tx.getOutput(i);
+                        UTXO utxo = new UTXO(tx.getHash(), i);
+                        this.utxoPool.addUTXO(utxo, out);
+                    }
+                }
+            }
+        }
+
+        return validTxs.toArray(new Transaction[0]);
+    }
+    
+    /**
+     * Required public function for Assignment 3.
+     * @return the current UTXOPool.
+     */
+    public UTXOPool getUTXOPool() {
+        return this.utxoPool;
+    }
+}
+
+
+Step-by-Step Explanation (Plain English)
+
+Here is a breakdown of what the BlockChain.java file is doing.
+
+The Core Idea: BlockNode
+
+The most important part of the solution is the private BlockNode class inside BlockChain.
+Think of it this way: just storing the Block isn't enough. Because of forks, you might have multiple blocks at the same height. You need to know:
+	1	What is this block's parent? (parent)
+	2	What is its height? (height)
+	3	Most importantly: What does the ledger (the UTXOPool) look like after this block's transactions are applied? (utxoPool)
+The BlockNode class is just a wrapper that holds this "context" for every block.
+
+The Methods Explained
+
+
+public BlockChain(Block genesisBlock) (The Constructor)
+
+	•	What it does: Starts the blockchain.
+	•	Plain English: When the blockchain is created, it's given a "genesis block" (the first-ever block).
+	1	It creates an empty UTXOPool for the genesis block.
+	2	It takes the genesis block's coinbase transaction (the reward for mining it) and adds it to that UTXOPool. This is the first "unspent coin" in the system.
+	3	It creates a BlockNode for the genesis block, sets its height to 1, and stores the UTXOPool we just made.
+	4	It sets this genesis node as the maxHeightNode (since it's the only one).
+
+public Block getMaxHeightBlock()
+
+	•	What it does: Returns the block at the end of the longest chain.
+	•	Plain English: It just looks at the maxHeightNode it's been tracking and returns the Block object from inside it.
+
+public UTXOPool getMaxHeightUTXOPool()
+
+	•	What it does: Returns the ledger state at the end of the longest chain.
+	•	Plain English: This is for the "miner" (in BlockHandler). The miner needs to know the current list of unspent coins to build a new block. This method gives them the UTXOPool from the maxHeightNode. It returns a copy so the miner can't mess up the blockchain's official record.
+
+public TransactionPool getTransactionPool()
+
+	•	What it does: Returns the list of all pending transactions.
+	•	Plain English: It just hands over the globalTxPool. The miner will grab transactions from this pool to include in a new block.
+
+public void addTransaction(Transaction tx)
+
+	•	What it does: Adds a new transaction to the pending pool.
+	•	Plain English: When a new transaction is broadcast to the network (like processTx in BlockHandler), it gets added to the globalTxPool, waiting to be mined.
+	•	Note: This is the method that was missing from your file before, which caused the compiler error.
+
+public boolean addBlock(Block block)
+
+	•	What it does: This is the most important method. It tries to add a new block to the chain.
+	•	Plain English:
+	1	Check 1 (Parent): It looks at the block's "previous hash." Does a block with that hash exist in our blockStore? If not, it's an "orphan block" and we can't add it.
+	2	Check 2 (Age): It finds the parent's height and adds 1. Is this new height too old (less than maxHeight - CUT_OFF_AGE)? If so, we reject it.
+	3	Check 3 (Validity): This is the key. It creates a new TxHandler and gives it the parent's UTXOPool. It then feeds all the block's transactions into the TxHandler. The TxHandler checks all 5 rules (signatures, double-spends, etc.). If handleTxs doesn't return all the transactions, it means one was invalid, so we reject the entire block.
+	4	Create New State: If the block is valid, we take the resulting UTXOPool from the TxHandler (which now reflects all the spent coins). We also add this new block's own coinbase transaction to it.
+	5	Store the Block: We create a new BlockNode for this block, storing the block, its parent, its new height, and its new UTXOPool. We add this node to our blockStore.
+	6	Update Leader: Is this new block's height greater than the maxHeightNode? If yes, it's the new leader! We set it as the new maxHeightNode. (It also handles the "oldest block" tie-breaking rule using the timestamp).
+	7	Clean Pool: We remove all the transactions that were just included in this block from the globalTxPool (since they are no longer "pending").
+	8	Prune: If the max height changed, it's a good time to clean up old, dead-end branches. It calls pruneBlockChain().
+
+private void pruneBlockChain()
+
+	•	What it does: Saves memory by deleting very old blocks.
+	•	Plain English:
+	1	It calculates the "cutoff height" (maxHeight - CUT_OFF_AGE).
+	2	It creates a new, empty "keep" list.
+	3	It loops through all blocks in its blockStore. If a block is "recent" (height >= cutoff height), it follows its parent, and its parent's parent, all the way back to the genesis block, adding all of them to the "keep" list.
+	4	After checking all recent branches, it throws away the old blockStore and replaces it with a new one containing only the blocks in the "keep" list. This deletes all the old, short, abandoned forks.
